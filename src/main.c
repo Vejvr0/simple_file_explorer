@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 700
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,6 +7,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <limits.h>
 #include <ncurses.h>
@@ -114,7 +117,7 @@ static void Create(char *status, size_t max_len, const char *path, const char *n
 
     check = mkdir(fullpath, 0777);
 
-    if (!check) {
+    if (check) {
         snprintf(status, max_len, "Create folder error '%s'", name);
     } else {
         snprintf(status, max_len, "Folder '%s' was create", name);
@@ -139,6 +142,106 @@ static void Remove(char *status, size_t max_len, const char *path, const char *n
     }
 
     refresh();
+}
+
+static int run_capture(char *const argv[], char *out, size_t outsz) {
+    int fd[2];
+    if (pipe(fd) != 0)
+        return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(fd[0]);
+        close(fd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(fd[0]);
+        dup2(fd[1], STDOUT_FILENO);
+        close(fd[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    close(fd[1]);
+
+    size_t len = 0;
+    ssize_t n;
+    while (len + 1 < outsz && (n = read(fd[0], out + len, outsz - 1 - len)) > 0)
+        len += (size_t)n;
+    out[len] = '\0';
+    close(fd[0]);
+
+    int wstatus;
+    waitpid(pid, &wstatus, 0);
+
+    if (len > 0 && out[len - 1] == '\n')
+        out[len - 1] = '\0';
+
+    return (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0) ? 0 : -1;
+}
+
+static int run_interactive(char *const argv[]) {
+    def_prog_mode();
+    endwin();
+
+    int result = -1;
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        _exit(127);
+    } else if (pid > 0) {
+        int wstatus;
+        waitpid(pid, &wstatus, 0);
+        if (WIFEXITED(wstatus))
+            result = WEXITSTATUS(wstatus);
+    }
+
+    reset_prog_mode();
+    refresh();
+
+    return result;
+}
+
+static void Open(char *status, size_t max_len, const char *path, const char *name) {
+    char fullpath[PATH_MAX];
+    char mime[128];
+
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", path, name);
+
+    char *file_argv[] = { "file", "--mime-type", "-b", fullpath, NULL };
+    if (run_capture(file_argv, mime, sizeof(mime)) != 0) {
+        snprintf(status, max_len, "Cannot detect type of '%s'", name);
+        return;
+    }
+
+    if (strncmp(mime, "text/", 5) == 0 || strcmp(mime, "application/json") == 0 ||
+        strcmp(mime, "inode/x-empty") == 0) {
+        char *editor_argv[] = { "sh", "-c", "${EDITOR:-nano} \"$1\"", "sh", fullpath, NULL };
+        int rc = run_interactive(editor_argv);
+
+        if (rc == 0)
+            snprintf(status, max_len, "Closed '%s'", name);
+        else
+            snprintf(status, max_len, "Editor error for '%s' (exit %d)", name, rc);
+    } else {
+        snprintf(status, max_len, "Unsupported file type: %s", mime);
+    }
+}
+
+static void save_cwd(const char *cwd) {
+    const char *target = getenv("EXPLORER_CWD_FILE");
+    if (target == NULL || target[0] == '\0' || cwd[0] == '\0')
+        return;
+
+    FILE *fp = fopen(target, "w");
+    if (fp == NULL)
+        return;
+
+    fprintf(fp, "%s", cwd);
+    fclose(fp);
 }
 
 static void fit_text(const char *src, char *dst, size_t dstsize, int width) {
@@ -261,7 +364,7 @@ static void draw(const char *path, const Entry *entries, int count, int sel, int
     snprintf(
         help,
         sizeof(help),
-        "[Arrows] move | [Enter] enter | [q] quit | [r] delete | [a] create |  Items: %d/%d",
+        "[Arrows] move | [Enter] open | [q] quit | [r] delete | [a] create |  Items: %d/%d",
         count > 0 ? sel + 1 : 0, count
     );
 
@@ -385,7 +488,7 @@ int main(int argc, char *argv[]) {
                 const Entry *e = &entries[sel];
 
                 if (!e->is_dir) {
-                    snprintf(status, sizeof(status), "'%s' is not directory", e->name);
+                    Open(status, sizeof(status), cwd, e->name);
                 } else if (chdir(e->name) != 0) {
                     snprintf(status, sizeof(status), "Cannot access to '%s': %s", e->name, strerror(errno));
                 } else {
@@ -409,6 +512,7 @@ int main(int argc, char *argv[]) {
         case 'A':
             Create(status, sizeof(status), cwd, "new_folder");
             reload = 1;
+            break;
 
         case KEY_RESIZE:
             break;
@@ -421,6 +525,7 @@ int main(int argc, char *argv[]) {
     }
 
     endwin();
+    save_cwd(cwd);
     free(entries);
 
     return 0;
